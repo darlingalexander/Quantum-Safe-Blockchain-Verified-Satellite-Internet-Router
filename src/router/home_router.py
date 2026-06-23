@@ -15,6 +15,7 @@ from typing import Tuple
 
 from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
+import requests
 
 from src.common.crypto_utils import (
     generate_pqc_keypair,
@@ -171,6 +172,17 @@ def receive_packet():
             tx_id, recomputed, tx_hash,
         )
         return jsonify({"status": "bad_request", "message": "Payload hash mismatch - tampering suspected"}), 400
+    # Verify the data hash against the immutable ledger before accepting
+    ledger_url = f"http://localhost:5003/transaction/{tx_hash}"
+    try:
+        ledger_resp = requests.get(ledger_url, timeout=3)
+        LOG.info("Ledger lookup for tx_hash=%.8s returned status=%s", tx_hash, ledger_resp.status_code)
+        if ledger_resp.status_code != 200:
+            LOG.error("Hash discrepancy on ledger for tx_id=%s tx_hash=%.8s - dropping packet", tx_id, tx_hash)
+            return 'Hash discrepancy on ledger - Dropping packet', 400
+    except Exception as e:
+        LOG.exception("Failed to query ledger for tx_id=%s: %s", tx_id, e)
+        return jsonify({"status": "error", "message": "Ledger lookup failed"}), 500
 
     LOG.info("Packet accepted: tx_id=%s hash verified", tx_id)
     return jsonify({"status": "accepted", "transaction_id": tx_id, "transaction_hash": tx_hash}), 200
