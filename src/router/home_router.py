@@ -20,7 +20,7 @@ import requests
 from src.common.crypto_utils import (
     generate_pqc_keypair,
     decapsulate_secret,
-    compute_sha256,
+    compute_sha256_hex_digest,
     DecapsulationError,
 )
 
@@ -161,7 +161,7 @@ def receive_packet():
 
     # Recompute SHA-256 and verify integrity
     try:
-        recomputed = compute_sha256(data_str)
+        recomputed = compute_sha256_hex_digest(data_str)
     except Exception as e:
         LOG.exception("Failed computing SHA-256 for tx_id=%s: %s", tx_id, e)
         return jsonify({"status": "error", "message": "Hash computation failed"}), 500
@@ -173,7 +173,7 @@ def receive_packet():
         )
         return jsonify({"status": "bad_request", "message": "Payload hash mismatch - tampering suspected"}), 400
     # Verify the data hash against the immutable ledger before accepting
-    ledger_url = f"http://localhost:5003/transaction/{tx_hash}"
+    ledger_url = f"http://127.0.0.1:5003/transaction/{tx_hash}"
     try:
         ledger_resp = requests.get(ledger_url, timeout=3)
         LOG.info("Ledger lookup for tx_hash=%.8s returned status=%s", tx_hash, ledger_resp.status_code)

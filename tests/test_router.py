@@ -55,7 +55,10 @@ class TestHomeRouterReceive:
         packet = _build_packet(ct_token_hex, ciphertext_hex, nonce_hex, tag_hex, tx_hash, 100)
 
         with patch("src.router.home_router.decapsulate_secret", return_value=shared_secret) as mock_decaps:
-            resp = client.post("/receive", data=json.dumps(packet), content_type="application/json")
+            # Mock ledger lookup to avoid external dependency during unit test
+            with patch("src.router.home_router.requests.get") as mock_ledger_get:
+                mock_ledger_get.return_value.status_code = 200
+                resp = client.post("/receive", data=json.dumps(packet), content_type="application/json")
             assert resp.status_code == 200
             assert resp.json["status"] == "accepted"
             assert resp.json["transaction_id"] == 100

@@ -74,6 +74,25 @@ def relay_packet():
         return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
     
     packet = request.get_json()
+    # Normalize packet shapes: accept both flattened packets and
+    # nested {"payload": {...}, "metadata": {...}} shapes produced by
+    # different gateway endpoints. Flatten into expected top-level fields.
+    if isinstance(packet, dict) and "payload" in packet and "metadata" in packet:
+        try:
+            nested_payload = packet.get("payload") or {}
+            nested_meta = packet.get("metadata") or {}
+            # Create a flattened packet merging payload and metadata
+            flat = {}
+            if isinstance(nested_payload, dict):
+                flat.update(nested_payload)
+            # metadata keys should not overwrite payload unless absent
+            for k, v in nested_meta.items():
+                if k not in flat:
+                    flat[k] = v
+            packet = flat
+            logger.info("[RELAY] Normalized nested payload/metadata into flat packet")
+        except Exception:
+            logger.exception("[RELAY] Failed to normalize nested packet shape")
     relay_stats["total_packets_received"] += 1
     
     # Extract packet identifiers for logging

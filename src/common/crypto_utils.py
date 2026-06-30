@@ -12,14 +12,15 @@ Functions:
     - generate_pqc_sign_keypair(): Generate ML-DSA signature keypair
     - sign_message(secret_key, message): Sign a message for node authentication
     - verify_signature(public_key, message, signature): Verify a signature
-    - compute_sha256(data): Compute SHA-256 hash of data
+    - compute_sha256_hex_digest(data): Compute a strict SHA-256 hex digest
 """
 
 import hashlib
+import re
 from typing import Tuple, Union
 
 try:
-    from pqcrypto.kem import ml_kem_1024
+    from pqcrypto.kem import ml_kem_1024, ml_kem_768
     from pqcrypto.sign import ml_dsa_87
 except ImportError:
     raise ImportError(
@@ -167,6 +168,68 @@ def decapsulate_secret(private_key: bytes, ciphertext: bytes) -> bytes:
         ) from e
 
 
+def generate_pqc_keypair_768() -> Tuple[bytes, bytes]:
+    """
+    Generate a post-quantum cryptography keypair using ML-KEM-768.
+
+    Returns:
+        Tuple[bytes, bytes]: (public_key, private_key)
+
+    Raises:
+        KeyGenerationError: If keypair generation fails.
+    """
+    try:
+        public_key, private_key = ml_kem_768.generate_keypair()
+        return public_key, private_key
+    except Exception as e:
+        raise KeyGenerationError(
+            f"Failed to generate PQC keypair (768): {str(e)}"
+        ) from e
+
+
+def encapsulate_kem_768(public_key: bytes) -> Tuple[bytes, bytes]:
+    """
+    Encapsulate a shared secret using ML-KEM-768 and the provided public key.
+
+    Returns:
+        Tuple[bytes, bytes]: (ciphertext, shared_secret)
+    """
+    if not isinstance(public_key, bytes):
+        raise EncapsulationError(
+            f"public_key must be bytes, got {type(public_key).__name__}"
+        )
+
+    try:
+        ciphertext, shared_secret = ml_kem_768.encrypt(public_key)
+        return ciphertext, shared_secret
+    except Exception as e:
+        raise EncapsulationError(f"Failed to encapsulate (768): {str(e)}") from e
+
+
+def decapsulate_kem_768(private_key: bytes, ciphertext: bytes) -> bytes:
+    """
+    Decapsulate a shared secret produced by ML-KEM-768.
+
+    Returns:
+        bytes: shared_secret
+    """
+    if not isinstance(private_key, bytes):
+        raise DecapsulationError(
+            f"private_key must be bytes, got {type(private_key).__name__}"
+        )
+
+    if not isinstance(ciphertext, bytes):
+        raise DecapsulationError(
+            f"ciphertext must be bytes, got {type(ciphertext).__name__}"
+        )
+
+    try:
+        shared_secret = ml_kem_768.decrypt(private_key, ciphertext)
+        return shared_secret
+    except Exception as e:
+        raise DecapsulationError(f"Failed to decapsulate (768): {str(e)}") from e
+
+
 def generate_pqc_sign_keypair() -> Tuple[bytes, bytes]:
     """
     Generate a post-quantum signature keypair using ML-DSA.
@@ -275,28 +338,30 @@ def verify_signature(public_key: bytes, message: Union[bytes, str], signature: b
         ) from e
 
 
-def compute_sha256(data: Union[bytes, str]) -> str:
+def compute_sha256_hex_digest(data: Union[bytes, str]) -> str:
     """
-    Compute SHA-256 hash of input data.
+    Compute a strict SHA-256 hex digest for the provided input data.
 
-    This function generates a SHA-256 hash digest of the provided data, which is
-    used for blockchain transaction verification, data integrity checking, and
-    creating cryptographic commitments in the satellite-router network.
+    This helper uses Python's built-in hashlib.sha256() implementation and
+    enforces a clean lowercase hexadecimal output string of exactly 64 characters.
+    It is intended for blockchain transaction verification, data integrity checks,
+    and cryptographic commitments within the satellite-router network.
 
     Args:
-        data (Union[bytes, str]): The data to hash. If str, encoded as UTF-8.
+        data (Union[bytes, str]): The data to hash. If str, it is encoded as UTF-8.
 
     Returns:
-        str: The hexadecimal digest of the SHA-256 hash.
+        str: A lowercase hexadecimal SHA-256 digest with exactly 64 characters.
 
     Raises:
         TypeError: If data is not bytes or str.
         ValueError: If string encoding fails.
+        CryptoError: If SHA-256 digest generation fails or produces an invalid format.
 
     Example:
-        >>> compute_sha256(b"quantum_satellite_data")
+        >>> compute_sha256_hex_digest(b"quantum_satellite_data")
         'a3b4c5d6e7f8g9h0i1j2k3l4m5n6o7p8'
-        >>> compute_sha256("transaction_block")
+        >>> compute_sha256_hex_digest("transaction_block")
         'x1y2z3a4b5c6d7e8f9g0h1i2j3k4l5m6'
     """
     if isinstance(data, str):
@@ -312,12 +377,21 @@ def compute_sha256(data: Union[bytes, str]) -> str:
         )
 
     try:
-        sha256_hash = hashlib.sha256(data)
-        return sha256_hash.hexdigest()
+        digest = hashlib.sha256(data).hexdigest()
     except Exception as e:
         raise CryptoError(
             f"Failed to compute SHA-256 hash: {str(e)}"
         ) from e
+
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise CryptoError(
+            "SHA-256 digest generation produced an invalid hex string"
+        )
+
+    return digest
+
+
+compute_sha256 = compute_sha256_hex_digest
 
 
 # Module initialization check
@@ -347,7 +421,7 @@ if __name__ == "__main__":
         # Test SHA-256
         print("  - Computing SHA-256 hash...")
         test_data = b"quantum_blockchain_satellite_router"
-        hash_result = compute_sha256(test_data)
+        hash_result = compute_sha256_hex_digest(test_data)
         print(f"    ✓ Hash: {hash_result[:16]}...")
 
         print("\n✓ All crypto utilities tests passed!")

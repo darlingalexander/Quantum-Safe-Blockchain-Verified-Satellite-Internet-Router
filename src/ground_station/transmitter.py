@@ -12,7 +12,7 @@ import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError
 
 
-SATELLITE_RELAY = "http://localhost:5001/relay"
+SATELLITE_RELAY = "http://127.0.0.1:5001/relay"
 LOG = logging.getLogger(__name__)
 
 

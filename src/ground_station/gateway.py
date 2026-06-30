@@ -20,7 +20,7 @@ from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
 from src.common.crypto_utils import (
-    compute_sha256,
+    compute_sha256_hex_digest,
     encapsulate_kem_768,
     generate_pqc_keypair_768,
 )
@@ -75,7 +75,7 @@ def payload() -> Any:
         return jsonify({"error": "Request must include 'data' (str) and 'url' (str)"}), 400
 
     print("Computing SHA-256 of payload data")
-    tx_hash = compute_sha256(data)
+    tx_hash = compute_sha256_hex_digest(data)
     print(f"Transaction hash: {tx_hash}")
 
     tx_id = _assign_tx_id(tx_hash)
@@ -131,8 +131,8 @@ def payload() -> Any:
     }
 
     # Register transaction with the Immutable Verification Ledger
-    ledger_post_url = "http://localhost:5003/transaction/new"
-    ledger_mine_url = "http://localhost:5003/mine"
+    ledger_post_url = "http://127.0.0.1:5003/transaction/new"
+    ledger_mine_url = "http://127.0.0.1:5003/mine"
     ledger_body = {
         "transaction_id": tx_id,
         "transaction_hash": tx_hash,
@@ -142,25 +142,74 @@ def payload() -> Any:
     try:
         print(f"Posting transaction to ledger: {ledger_post_url} -> tx_id={tx_id}")
         ledger_resp = requests.post(ledger_post_url, json=ledger_body, timeout=3)
-        print(f"Ledger POST response: {ledger_resp.status_code}")
-    except Exception as e:
-        print(f"Failed to POST transaction to ledger: {e}")
+        if not ledger_resp.ok:
+            try:
+                lr = ledger_resp.json()
+            except Exception:
+                lr = ledger_resp.text
+            print(f"Ledger responded with non-2xx: {ledger_resp.status_code} body={lr}")
+        else:
+            print(f"Ledger POST response: {ledger_resp.status_code}")
+    except requests.exceptions.Timeout as exc:
+        print(f"Failed to POST transaction to ledger (timeout): {exc}")
+    except requests.exceptions.ConnectionError as exc:
+        print(f"Failed to POST transaction to ledger (connection error): {exc}")
+    except requests.RequestException as exc:
+        print(f"Failed to POST transaction to ledger: {exc}")
 
     # Trigger mining to confirm the transaction in this simulation
     try:
         print(f"Triggering ledger mining: {ledger_mine_url}")
         mine_resp = requests.get(ledger_mine_url, timeout=5)
-        print(f"Ledger mine response: {mine_resp.status_code}")
-    except Exception as e:
-        print(f"Failed to trigger ledger mining: {e}")
+        if not mine_resp.ok:
+            print(f"Ledger mining returned non-2xx: {mine_resp.status_code} body={mine_resp.text}")
+        else:
+            print(f"Ledger mine response: {mine_resp.status_code}")
+    except requests.exceptions.Timeout as exc:
+        print(f"Failed to trigger ledger mining (timeout): {exc}")
+    except requests.exceptions.ConnectionError as exc:
+        print(f"Failed to trigger ledger mining (connection error): {exc}")
+    except requests.RequestException as exc:
+        print(f"Failed to trigger ledger mining: {exc}")
 
     # For demonstration, attempt to POST the packet to the destination relay
     try:
         print(f"Relaying packet to {dest_url}")
-        resp = requests.post(dest_url, json=packet, timeout=3)
-        print(f"Relay response: {resp.status_code}")
-    except Exception as e:
-        print(f"Relay to destination failed: {e}")
+        resp = requests.post(dest_url, json=packet, timeout=5)
+    except requests.exceptions.Timeout as exc:
+        print(f"Relay to destination timed out: {exc}")
+        return jsonify({
+            "error": "Timeout relaying packet to destination",
+            "destination": dest_url,
+            "details": str(exc),
+        }), 504
+    except requests.exceptions.ConnectionError as exc:
+        print(f"Relay to destination connection error: {exc}")
+        return jsonify({
+            "error": "Connection error relaying packet to destination",
+            "destination": dest_url,
+            "details": str(exc),
+        }), 502
+    except requests.RequestException as exc:
+        print(f"Relay to destination request error: {exc}")
+        return jsonify({
+            "error": "Error relaying packet to destination",
+            "destination": dest_url,
+            "details": str(exc),
+        }), 502
+
+    if not resp.ok:
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+        print(f"Relay downstream non-2xx: {resp.status_code} body={body}")
+        return jsonify({
+            "error": "Destination returned non-success status",
+            "destination": dest_url,
+            "status_code": resp.status_code,
+            "downstream_response": body,
+        }), resp.status_code
 
     return jsonify({"status": "ok", "transaction_id": tx_id, "transaction_hash": tx_hash}), 200
 
