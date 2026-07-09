@@ -1,12 +1,25 @@
 import json
 import os
+import sys
+import time
+from pathlib import Path
 from typing import Any, Dict
 
 import requests
 from ecdsa import SECP256k1, SigningKey
 from flask import Flask, jsonify, request
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
 
-from src.common.crypto_utils import compute_sha256_hex_digest
+
+if __package__ in (None, ""):
+    # Support direct execution: python src/ground_station/app.py
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+
+from src.common.crypto_utils import compute_sha256_hex_digest, encapsulate_secret
 
 
 app = Flask(__name__)
@@ -47,15 +60,36 @@ def build_transaction_hash(payload: Dict[str, Any]) -> str:
     return compute_sha256_hex_digest(canonical)
 
 
+def _symmetric_encrypt(shared_key: bytes, plaintext: bytes) -> Dict[str, str]:
+    """Encrypt plaintext with AES-GCM using shared key material."""
+    key = shared_key[:32]
+    nonce = get_random_bytes(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+    return {
+        "ciphertext": ciphertext.hex(),
+        "nonce": nonce.hex(),
+        "tag": tag.hex(),
+    }
+
+
 @app.route("/broadcast", methods=["POST"])
 def broadcast() -> Any:
     """Receive a transaction payload, sign and hash it, then relay to satellite."""
+    print("[Ground Station] Packet received.")
+    print("[GROUND] /broadcast called")
+    print(f"[GROUND] Incoming headers: {dict(request.headers)}")
+
     try:
         incoming = request.get_json(force=True)
-    except Exception:
-        return jsonify({"error": "Invalid JSON payload"}), 400
+    except Exception as exc:
+        print(f"[GROUND] 400 Invalid JSON payload: {exc}")
+        return jsonify({"error": "Invalid JSON payload", "details": str(exc)}), 400
+
+    print(f"[GROUND] Incoming JSON: {incoming}")
 
     if not isinstance(incoming, dict):
+        print("[GROUND] 400 Payload is not a JSON object")
         return jsonify({"error": "Payload must be a JSON object"}), 400
 
     # Normalize supported shapes:
@@ -67,12 +101,114 @@ def broadcast() -> Any:
     else:
         payload = incoming
 
+    data_value = payload.get("data")
+    destination = payload.get("url")
+    if not isinstance(data_value, str) or not isinstance(destination, str):
+        print(f"[GROUND] 400 Missing required payload fields. payload={payload}")
+        return jsonify({
+            "error": "Payload must include 'data' (str) and 'url' (str)",
+            "received_payload": payload,
+        }), 400
+
     payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    transaction_hash = build_transaction_hash(payload)
-    signature = generate_ecdsa_signature(payload_bytes)
+    # Router verifies hash over decrypted plaintext data only.
+    transaction_hash = compute_sha256_hex_digest(data_value)
+    # Ledger verifies legacy signatures over the transaction hash bytes.
+    signature = generate_ecdsa_signature(transaction_hash.encode("utf-8"))
+
+    # Obtain the router public key from the destination service so we can
+    # construct the packet shape expected by the relay/home-router chain.
+    pubkey_url = destination.rstrip("/")
+    if pubkey_url.endswith("/receive"):
+        pubkey_url = pubkey_url[: -len("/receive")]
+    pubkey_url = pubkey_url.rstrip("/") + "/pqc_pubkey"
+
+    try:
+        pk_resp = requests.get(pubkey_url, timeout=3)
+        if pk_resp.status_code != 200:
+            print(f"[GROUND] 400 Destination key fetch failed: status={pk_resp.status_code}")
+            return jsonify({
+                "error": "Failed to fetch destination public key",
+                "destination": destination,
+                "pubkey_url": pubkey_url,
+                "status_code": pk_resp.status_code,
+            }), 400
+        pk_json = pk_resp.json()
+        pk_hex = pk_json.get("public_key")
+        if not isinstance(pk_hex, str):
+            print(f"[GROUND] 400 Invalid destination public key payload: {pk_json}")
+            return jsonify({
+                "error": "Destination public key response missing 'public_key'",
+                "destination": destination,
+                "pubkey_url": pubkey_url,
+            }), 400
+        destination_public_key = bytes.fromhex(pk_hex)
+    except Exception as exc:
+        print(f"[GROUND] 400 Could not fetch/parse destination public key: {exc}")
+        return jsonify({
+            "error": "Could not fetch destination public key",
+            "destination": destination,
+            "pubkey_url": pubkey_url,
+            "details": str(exc),
+        }), 400
+
+    try:
+        ciphertext_token, shared_secret = encapsulate_secret(destination_public_key)
+        encrypted = _symmetric_encrypt(shared_secret, data_value.encode("utf-8"))
+    except Exception as exc:
+        print(f"[GROUND] 400 Failed building encrypted packet: {exc}")
+        return jsonify({
+            "error": "Failed building encrypted packet",
+            "details": str(exc),
+        }), 400
+
+    tx_id = int(time.time() * 1000)
+
+    # Register transaction with ledger and mine so the router verification step succeeds.
+    ledger_body = {
+        "transaction_id": tx_id,
+        "transaction_hash": transaction_hash,
+        "legacy_signature": signature,
+        "signing_public_key": PUBLIC_KEY_HEX,
+    }
+    try:
+        ledger_post = requests.post("http://127.0.0.1:5003/transaction/new", json=ledger_body, timeout=3)
+        if ledger_post.status_code not in (200, 201):
+            print(f"[GROUND] 400 Ledger rejected transaction: {ledger_post.status_code} {ledger_post.text}")
+            return jsonify({
+                "error": "Ledger rejected transaction",
+                "status_code": ledger_post.status_code,
+                "ledger_response": ledger_post.text,
+            }), 400
+        mine_resp = requests.get("http://127.0.0.1:5003/mine", timeout=5)
+        if mine_resp.status_code not in (200, 201):
+            print(f"[GROUND] 400 Ledger mining failed: {mine_resp.status_code} {mine_resp.text}")
+            return jsonify({
+                "error": "Ledger mining failed",
+                "status_code": mine_resp.status_code,
+                "ledger_response": mine_resp.text,
+            }), 400
+    except Exception as exc:
+        print(f"[GROUND] 400 Ledger operation failed: {exc}")
+        return jsonify({
+            "error": "Ledger operation failed",
+            "details": str(exc),
+        }), 400
 
     relay_body = {
-        "payload": payload,
+        "payload": {
+            "data": data_value,
+            "destination": destination,
+            "encrypted_payload": encrypted["ciphertext"],
+            "cipher_meta": {
+                "nonce": encrypted["nonce"],
+                "tag": encrypted["tag"],
+            },
+            "ciphertext_token": ciphertext_token.hex(),
+            "transaction_hash": transaction_hash,
+            "transaction_id": tx_id,
+            "legacy_signing_public_key": PUBLIC_KEY_HEX,
+        },
         "metadata": {
             "legacy_ecdsa_signature": signature,
             "transaction_hash": transaction_hash,
@@ -80,44 +216,24 @@ def broadcast() -> Any:
         },
     }
 
-    # Forward to the satellite relay and handle errors cleanly
-    try:
-        resp = requests.post(
-            SATELLITE_RELAY_URL,
-            json=relay_body,
-            timeout=5,
-        )
-    except requests.exceptions.Timeout as exc:
-        return jsonify({
-            "error": "Satellite relay request timed out",
-            "satellite_relay_url": SATELLITE_RELAY_URL,
-            "details": str(exc),
-        }), 504
-    except requests.exceptions.ConnectionError as exc:
-        return jsonify({
-            "error": "Could not connect to satellite relay",
-            "satellite_relay_url": SATELLITE_RELAY_URL,
-            "details": str(exc),
-        }), 502
-    except requests.RequestException as exc:
-        return jsonify({
-            "error": "Error sending request to satellite relay",
-            "satellite_relay_url": SATELLITE_RELAY_URL,
-            "details": str(exc),
-        }), 502
+    print(f"[GROUND] Relay URL: {SATELLITE_RELAY_URL}")
+    print(f"[GROUND] Relay payload: {relay_body}")
 
-    # Surface descriptive downstream errors if the satellite relay replies with non-2xx
-    if not resp.ok:
-        try:
-            satellite_body = resp.json()
-        except Exception:
-            satellite_body = resp.text
-        return jsonify({
-            "error": "Satellite relay returned non-success status",
-            "satellite_relay_url": SATELLITE_RELAY_URL,
-            "satellite_status_code": resp.status_code,
-            "satellite_response": satellite_body,
-        }), resp.status_code
+    # Phase 3 forwarding: best-effort forward to the satellite relay.
+    # Ground station must continue operating even if relay is unavailable.
+    relay_url = "http://127.0.0.1:5001/relay"
+    print("[Ground Station] Forwarding packet to Satellite Relay...")
+    try:
+        forward_resp = requests.post(relay_url, json=relay_body, timeout=5)
+        if forward_resp.ok:
+            print("[Ground Station] Successfully forwarded to Satellite Relay.")
+        else:
+            print(
+                "[Ground Station] Relay forwarding returned non-success: "
+                f"status={forward_resp.status_code}, body={forward_resp.text}"
+            )
+    except requests.exceptions.RequestException as e:
+        print(f"[Ground Station] Relay forwarding failed: {e}")
 
     return jsonify(
         {
@@ -127,6 +243,12 @@ def broadcast() -> Any:
             "transaction_hash": transaction_hash,
         }
     ), 200
+
+
+@app.route("/health", methods=["GET"])
+def health() -> Any:
+    """Health check endpoint for dashboard and service monitors."""
+    return jsonify({"status": "healthy"}), 200
 
 
 if __name__ == "__main__":

@@ -68,6 +68,8 @@ def relay_packet():
         - 502 Bad Gateway if downstream router unreachable
     """
     
+    print("[Relay] Packet received.")
+
     # Verify request has JSON data
     if not request.is_json:
         logger.warning("[RELAY] Rejected non-JSON request from %s", request.remote_addr)
@@ -105,6 +107,7 @@ def relay_packet():
     )
     
     # Simulate orbital propagation latency
+    print("[Relay] Applying orbital latency...")
     logger.info("[RELAY] Applying orbital latency: %.1f ms (%.3f sec)", ORBITAL_LATENCY_SECS * 1000, ORBITAL_LATENCY_SECS)
     time.sleep(ORBITAL_LATENCY_SECS)
     
@@ -119,6 +122,7 @@ def relay_packet():
     
     if is_dropped:
         relay_stats["packets_dropped"] += 1
+        print("[Relay] Packet dropped due to simulated attenuation.")
         logger.warning(
             "[RELAY] Simulated packet loss: tx_id=%s, tx_hash=%.8s (atmospheric attenuation)",
             tx_id, tx_hash
@@ -131,20 +135,24 @@ def relay_packet():
         }), 408
     
     # Packet survives: forward to router node
+    destination = packet.get("destination")
+    router_endpoint = destination if isinstance(destination, str) and destination else ROUTER_NODE_ENDPOINT
+
     logger.info(
         "[RELAY] Forwarding packet to router: %s (tx_id=%s, tx_hash=%.8s)",
-        ROUTER_NODE_ENDPOINT, tx_id, tx_hash
+        router_endpoint, tx_id, tx_hash
     )
     
     try:
         response = requests.post(
-            ROUTER_NODE_ENDPOINT,
+            router_endpoint,
             json=packet,
             timeout=5.0,
         )
         
         if response.status_code == 200:
             relay_stats["packets_forwarded"] += 1
+            print("[Relay] Packet forwarded to Home Router.")
             logger.info(
                 "[RELAY] Forwarding success: tx_id=%s, router_status=%s",
                 tx_id, response.status_code
@@ -174,7 +182,7 @@ def relay_packet():
         relay_stats["forwarding_failures"] += 1
         logger.error(
             "[RELAY] Forwarding timeout: tx_id=%s, endpoint=%s",
-            tx_id, ROUTER_NODE_ENDPOINT
+            tx_id, router_endpoint
         )
         return jsonify({
             "status": "forwarding_timeout",
@@ -187,7 +195,7 @@ def relay_packet():
         relay_stats["forwarding_failures"] += 1
         logger.error(
             "[RELAY] Forwarding connection error: tx_id=%s, endpoint=%s, error=%s",
-            tx_id, ROUTER_NODE_ENDPOINT, str(e)
+            tx_id, router_endpoint, str(e)
         )
         return jsonify({
             "status": "forwarding_connection_error",
@@ -200,7 +208,7 @@ def relay_packet():
         relay_stats["forwarding_failures"] += 1
         logger.error(
             "[RELAY] Forwarding request error: tx_id=%s, endpoint=%s, error=%s",
-            tx_id, ROUTER_NODE_ENDPOINT, str(e)
+            tx_id, router_endpoint, str(e)
         )
         return jsonify({
             "status": "forwarding_error",

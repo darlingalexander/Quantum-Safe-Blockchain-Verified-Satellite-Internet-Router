@@ -1,0 +1,57 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Ground Station App",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/ground_station/app.py",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Satellite Relay",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/satellite/relay.py",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Home Router",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/router/home_router.py",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Ledger",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/blockchain/ledger.py",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Adversary SDR",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/adversary/sdr_attacker.py",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Streamlit Dashboard",
+      "type": "python",
+      "request": "launch",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "${workspaceFolder}/src/ui/dashboard.py"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}
