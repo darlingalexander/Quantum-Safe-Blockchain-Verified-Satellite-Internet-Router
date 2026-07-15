@@ -29,6 +29,7 @@ PACKET_DROP_RATE = 0.02       # 2% packet loss due to atmospheric attenuation
 
 # Downstream router node endpoint
 ROUTER_NODE_ENDPOINT = "http://localhost:5002/receive"
+ADVERSARY_SDR_ENDPOINT = "http://127.0.0.1:5004/intercept"
 
 # Flask app initialization
 app = Flask(__name__)
@@ -43,6 +44,47 @@ relay_stats = {
 }
 
 
+def _payload_size_bytes(payload):
+    try:
+        return len(request.get_data(cache=True) if request else b"")
+    except Exception:
+        return -1
+
+
+def _log_packet_event(
+    *,
+    incoming_endpoint,
+    destination_endpoint,
+    payload_size_bytes,
+    http_status_code,
+    forwarding_succeeded,
+    forwarding_failed,
+    relay_latency_ms,
+    packet_dropped,
+):
+    logger.info(
+        "incoming_endpoint=%s destination_endpoint=%s payload_size_bytes=%s http_status_code=%s "
+        "forwarding_succeeded=%s forwarding_failed=%s relay_latency_ms=%s packet_dropped=%s",
+        incoming_endpoint,
+        destination_endpoint,
+        payload_size_bytes,
+        http_status_code,
+        forwarding_succeeded,
+        forwarding_failed,
+        relay_latency_ms,
+        packet_dropped,
+    )
+
+
+# Make sure these imports are at the very top of your src/satellite/relay.py file
+import time
+import random
+
+# Place these configurations near the top of the file as well
+ORBITAL_LATENCY_SECS = 0.150  # 150ms transit delay simulation
+PACKET_DROP_RATE = 0.10       # 10% simulated signal loss packet drop
+
+# REPLACE YOUR OLD @app.route("/relay") BLOCK WITH THIS ONE:
 @app.route("/relay", methods=["POST"])
 def relay_packet():
     """
@@ -60,14 +102,24 @@ def relay_packet():
         "legacy_signing_public_key": str,
         "destination": str
     }
-    
-    Returns:
-        - 200 OK with forwarding confirmation if packet survives and is relayed
-        - 408 Timeout if packet is dropped (simulating atmospheric attenuation)
-        - 400 Bad Request if payload is invalid
-        - 502 Bad Gateway if downstream router unreachable
     """
-    
+    try:
+        packet = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Bad packet shape reaching space link"}), 400
+
+    payload_size_bytes = _payload_size_bytes(packet)
+    _log_packet_event(
+        incoming_endpoint="/relay",
+        destination_endpoint="N/A",
+        payload_size_bytes=payload_size_bytes,
+        http_status_code="N/A",
+        forwarding_succeeded=False,
+        forwarding_failed=False,
+        relay_latency_ms="N/A",
+        packet_dropped=False,
+    )
+
     print("[Relay] Packet received.")
 
     # Verify request has JSON data
@@ -75,7 +127,6 @@ def relay_packet():
         logger.warning("[RELAY] Rejected non-JSON request from %s", request.remote_addr)
         return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
     
-    packet = request.get_json()
     # Normalize packet shapes: accept both flattened packets and
     # nested {"payload": {...}, "metadata": {...}} shapes produced by
     # different gateway endpoints. Flatten into expected top-level fields.
@@ -105,11 +156,24 @@ def relay_packet():
         "[RELAY] Packet entry: tx_id=%s, tx_hash=%.8s, from_addr=%s",
         tx_id, tx_hash, request.remote_addr
     )
+
+    intercept_flag = packet.get("intercept", False)
+    if isinstance(intercept_flag, str):
+        intercept_flag = intercept_flag.strip().lower() in ("1", "true", "yes", "on")
+
+    forward_endpoint = ADVERSARY_SDR_ENDPOINT if intercept_flag else "http://127.0.0.1:5002/receive"
+    logger.info(
+        "[RELAY] Routing mode: %s (forward_endpoint=%s)",
+        "ATTACK" if intercept_flag else "NORMAL",
+        forward_endpoint,
+    )
     
     # Simulate orbital propagation latency
     print("[Relay] Applying orbital latency...")
+    latency_start = time.perf_counter()
     logger.info("[RELAY] Applying orbital latency: %.1f ms (%.3f sec)", ORBITAL_LATENCY_SECS * 1000, ORBITAL_LATENCY_SECS)
     time.sleep(ORBITAL_LATENCY_SECS)
+    relay_latency_ms = round((time.perf_counter() - latency_start) * 1000, 2)
     
     # Determine if packet is dropped due to atmospheric attenuation
     drop_roll = random.random()
@@ -122,24 +186,28 @@ def relay_packet():
     
     if is_dropped:
         relay_stats["packets_dropped"] += 1
-        print("[Relay] Packet dropped due to simulated attenuation.")
-        logger.warning(
-            "[RELAY] Simulated packet loss: tx_id=%s, tx_hash=%.8s (atmospheric attenuation)",
-            tx_id, tx_hash
+        print("[Relay] Packet dropped.")
+        _log_packet_event(
+            incoming_endpoint="/relay",
+            destination_endpoint=forward_endpoint,
+            payload_size_bytes=payload_size_bytes,
+            http_status_code=200,
+            forwarding_succeeded=False,
+            forwarding_failed=False,
+            relay_latency_ms=relay_latency_ms,
+            packet_dropped=True,
         )
         return jsonify({
             "status": "dropped",
-            "message": "Packet lost due to simulated atmospheric attenuation",
             "transaction_id": tx_id,
             "transaction_hash": tx_hash,
-        }), 408
+        }), 200
     
     # Packet survives: forward to router node
-    destination = packet.get("destination")
-    router_endpoint = destination if isinstance(destination, str) and destination else ROUTER_NODE_ENDPOINT
+    router_endpoint = forward_endpoint
 
     logger.info(
-        "[RELAY] Forwarding packet to router: %s (tx_id=%s, tx_hash=%.8s)",
+        "[RELAY] Forwarding packet downstream: %s (tx_id=%s, tx_hash=%.8s)",
         router_endpoint, tx_id, tx_hash
     )
     
@@ -147,11 +215,23 @@ def relay_packet():
         response = requests.post(
             router_endpoint,
             json=packet,
-            timeout=5.0,
+            timeout=5,
+        )
+
+        _log_packet_event(
+            incoming_endpoint="/relay",
+            destination_endpoint=router_endpoint,
+            payload_size_bytes=payload_size_bytes,
+            http_status_code=response.status_code,
+            forwarding_succeeded=response.status_code == 200,
+            forwarding_failed=response.status_code != 200,
+            relay_latency_ms=relay_latency_ms,
+            packet_dropped=False,
         )
         
         if response.status_code == 200:
             relay_stats["packets_forwarded"] += 1
+            print("[Relay] Forward successful.")
             print("[Relay] Packet forwarded to Home Router.")
             logger.info(
                 "[RELAY] Forwarding success: tx_id=%s, router_status=%s",
@@ -180,6 +260,17 @@ def relay_packet():
     
     except requests.Timeout:
         relay_stats["forwarding_failures"] += 1
+        print("[Relay] Forward failed.")
+        _log_packet_event(
+            incoming_endpoint="/relay",
+            destination_endpoint=router_endpoint,
+            payload_size_bytes=payload_size_bytes,
+            http_status_code=504,
+            forwarding_succeeded=False,
+            forwarding_failed=True,
+            relay_latency_ms=relay_latency_ms,
+            packet_dropped=False,
+        )
         logger.error(
             "[RELAY] Forwarding timeout: tx_id=%s, endpoint=%s",
             tx_id, router_endpoint
@@ -191,8 +282,20 @@ def relay_packet():
             "transaction_hash": tx_hash,
         }), 504
     
-    except requests.ConnectionError as e:
+    except requests.exceptions.ConnectionError as e:
         relay_stats["forwarding_failures"] += 1
+        print("[Relay] Forward failed.")
+        print(f"[Relay] Forward failed to {router_endpoint}: {e}")
+        _log_packet_event(
+            incoming_endpoint="/relay",
+            destination_endpoint=router_endpoint,
+            payload_size_bytes=payload_size_bytes,
+            http_status_code=502,
+            forwarding_succeeded=False,
+            forwarding_failed=True,
+            relay_latency_ms=relay_latency_ms,
+            packet_dropped=False,
+        )
         logger.error(
             "[RELAY] Forwarding connection error: tx_id=%s, endpoint=%s, error=%s",
             tx_id, router_endpoint, str(e)
@@ -204,8 +307,20 @@ def relay_packet():
             "transaction_hash": tx_hash,
         }), 502
     
-    except requests.RequestException as e:
+    except requests.exceptions.RequestException as e:
         relay_stats["forwarding_failures"] += 1
+        print("[Relay] Forward failed.")
+        print(f"[Relay] Forward failed to {router_endpoint}: {e}")
+        _log_packet_event(
+            incoming_endpoint="/relay",
+            destination_endpoint=router_endpoint,
+            payload_size_bytes=payload_size_bytes,
+            http_status_code=502,
+            forwarding_succeeded=False,
+            forwarding_failed=True,
+            relay_latency_ms=relay_latency_ms,
+            packet_dropped=False,
+        )
         logger.error(
             "[RELAY] Forwarding request error: tx_id=%s, endpoint=%s, error=%s",
             tx_id, router_endpoint, str(e)

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 import time
@@ -24,10 +25,49 @@ from src.common.crypto_utils import compute_sha256_hex_digest, encapsulate_secre
 
 app = Flask(__name__)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+LOG = logging.getLogger(__name__)
+
 SATELLITE_RELAY_URL = os.getenv(
     "SATELLITE_RELAY_URL", "http://127.0.0.1:5001/relay"
 )
 ECDSA_PRIVATE_KEY_HEX = os.getenv("GROUND_STATION_ECDSA_PRIVKEY_HEX")
+
+
+def _payload_size_bytes(payload: Any) -> int:
+    try:
+        return len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
+    except Exception:
+        return -1
+
+
+def _log_packet_event(
+    *,
+    incoming_endpoint: str,
+    destination_endpoint: str,
+    payload_size_bytes: int,
+    http_status_code: Any,
+    forwarding_succeeded: bool,
+    forwarding_failed: bool,
+    relay_latency_ms: Any,
+    packet_dropped: bool,
+) -> None:
+    LOG.info(
+        "incoming_endpoint=%s destination_endpoint=%s payload_size_bytes=%s http_status_code=%s "
+        "forwarding_succeeded=%s forwarding_failed=%s relay_latency_ms=%s packet_dropped=%s",
+        incoming_endpoint,
+        destination_endpoint,
+        payload_size_bytes,
+        http_status_code,
+        forwarding_succeeded,
+        forwarding_failed,
+        relay_latency_ms,
+        packet_dropped,
+    )
 
 
 def load_signing_key() -> SigningKey:
@@ -87,6 +127,17 @@ def broadcast() -> Any:
         return jsonify({"error": "Invalid JSON payload", "details": str(exc)}), 400
 
     print(f"[GROUND] Incoming JSON: {incoming}")
+    incoming_payload_size = _payload_size_bytes(incoming)
+    _log_packet_event(
+        incoming_endpoint="/broadcast",
+        destination_endpoint="N/A",
+        payload_size_bytes=incoming_payload_size,
+        http_status_code="N/A",
+        forwarding_succeeded=False,
+        forwarding_failed=False,
+        relay_latency_ms="N/A",
+        packet_dropped=False,
+    )
 
     if not isinstance(incoming, dict):
         print("[GROUND] 400 Payload is not a JSON object")
@@ -103,12 +154,15 @@ def broadcast() -> Any:
 
     data_value = payload.get("data")
     destination = payload.get("url")
+    intercept_enabled = payload.get("intercept", False)
     if not isinstance(data_value, str) or not isinstance(destination, str):
         print(f"[GROUND] 400 Missing required payload fields. payload={payload}")
         return jsonify({
             "error": "Payload must include 'data' (str) and 'url' (str)",
             "received_payload": payload,
         }), 400
+
+    print("[Ground Station] Packet verified")
 
     payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     # Router verifies hash over decrypted plaintext data only.
@@ -188,8 +242,8 @@ def broadcast() -> Any:
                 "status_code": mine_resp.status_code,
                 "ledger_response": mine_resp.text,
             }), 400
-    except Exception as exc:
-        print(f"[GROUND] 400 Ledger operation failed: {exc}")
+    except requests.exceptions.RequestException as exc:
+        print(f"[GROUND] 400 Ledger operation failed while calling http://127.0.0.1:5003/transaction/new or http://127.0.0.1:5003/mine: {exc}")
         return jsonify({
             "error": "Ledger operation failed",
             "details": str(exc),
@@ -199,6 +253,7 @@ def broadcast() -> Any:
         "payload": {
             "data": data_value,
             "destination": destination,
+            "intercept": bool(intercept_enabled),
             "encrypted_payload": encrypted["ciphertext"],
             "cipher_meta": {
                 "nonce": encrypted["nonce"],
@@ -223,8 +278,21 @@ def broadcast() -> Any:
     # Ground station must continue operating even if relay is unavailable.
     relay_url = "http://127.0.0.1:5001/relay"
     print("[Ground Station] Forwarding packet to Satellite Relay...")
+    relay_payload_size = _payload_size_bytes(relay_body)
+    relay_start = time.perf_counter()
     try:
         forward_resp = requests.post(relay_url, json=relay_body, timeout=5)
+        relay_latency_ms = round((time.perf_counter() - relay_start) * 1000, 2)
+        _log_packet_event(
+            incoming_endpoint="/broadcast",
+            destination_endpoint=relay_url,
+            payload_size_bytes=relay_payload_size,
+            http_status_code=forward_resp.status_code,
+            forwarding_succeeded=forward_resp.ok,
+            forwarding_failed=not forward_resp.ok,
+            relay_latency_ms=relay_latency_ms,
+            packet_dropped=False,
+        )
         if forward_resp.ok:
             print("[Ground Station] Successfully forwarded to Satellite Relay.")
         else:
@@ -233,7 +301,18 @@ def broadcast() -> Any:
                 f"status={forward_resp.status_code}, body={forward_resp.text}"
             )
     except requests.exceptions.RequestException as e:
-        print(f"[Ground Station] Relay forwarding failed: {e}")
+        relay_latency_ms = round((time.perf_counter() - relay_start) * 1000, 2)
+        _log_packet_event(
+            incoming_endpoint="/broadcast",
+            destination_endpoint=relay_url,
+            payload_size_bytes=relay_payload_size,
+            http_status_code="N/A",
+            forwarding_succeeded=False,
+            forwarding_failed=True,
+            relay_latency_ms=relay_latency_ms,
+            packet_dropped=False,
+        )
+        print(f"[Ground Station] Relay forwarding failed to {relay_url}: {e}")
 
     return jsonify(
         {
